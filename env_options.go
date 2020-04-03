@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -14,7 +15,7 @@ type EnvOptions map[string]interface{}
 //
 // Fields in the options struct must have an `env` and `cfg` tag to be read
 // from the environment
-func (cfg EnvOptions) LoadEnvForStruct(options interface{}) {
+func (cfg EnvOptions) LoadEnvForStruct(options interface{}, debugEnv bool) {
 	val := reflect.ValueOf(options)
 	var typ reflect.Type
 	if val.Kind() == reflect.Ptr {
@@ -32,7 +33,7 @@ func (cfg EnvOptions) LoadEnvForStruct(options interface{}) {
 		fieldV := reflect.Indirect(val).Field(i)
 
 		if field.Type.Kind() == reflect.Struct && field.Anonymous {
-			cfg.LoadEnvForStruct(fieldV.Interface())
+			cfg.LoadEnvForStruct(fieldV.Interface(), debugEnv)
 			continue
 		}
 
@@ -46,9 +47,17 @@ func (cfg EnvOptions) LoadEnvForStruct(options interface{}) {
 			// resolvable fields must have the `env` and `cfg` struct tag
 			continue
 		}
+
 		v := os.Getenv(envName)
 		if v != "" {
+			if debugEnv {
+				fmt.Printf("++ %s=%s\n", envName, v)
+			}
 			cfg[cfgName] = v
+		} else {
+			if debugEnv {
+				fmt.Printf("   %s=%s\n", envName, v)
+			}
 		}
 	}
 }

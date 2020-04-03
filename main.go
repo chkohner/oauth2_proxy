@@ -144,6 +144,8 @@ func main() {
 	flagSet.String("pubjwk-url", "", "JWK pubkey access endpoint: required by login.gov")
 	flagSet.Bool("gcp-healthchecks", false, "Enable GCP/GKE healthcheck endpoints")
 
+	debugEnvConfig := flagSet.Bool("debug-env-config", false, "Print the config variables from the current environment and their values (if any)")
+
 	flagSet.Parse(os.Args[1:])
 
 	if *showVersion {
@@ -160,7 +162,7 @@ func main() {
 			logger.Fatalf("ERROR: failed to load config file %s - %s", *config, err)
 		}
 	}
-	cfg.LoadEnvForStruct(opts)
+	cfg.LoadEnvForStruct(opts, *debugEnvConfig)
 	options.Resolve(opts, flagSet, cfg)
 
 	err := opts.Validate()
