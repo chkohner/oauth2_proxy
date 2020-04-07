@@ -31,6 +31,8 @@ An example [oauth2-proxy.cfg]({{ site.gitweb }}/contrib/oauth2-proxy.cfg.example
 | `-basic-auth-password` | string | the password to set when passing the HTTP Basic Auth header | |
 | `-claim-authorization` | string | define a claim-based authorization rule (may be repeated) | |
 | `-claim-authorizations-file` | string | read claim-based authorization rules from a file (one per line) | |
+| `-claims-fwd-query` | string | extract/transform claims to be forwarded from user's claims object | |
+| `-pass-claims-fwd` | bool | if true, pass the result of `-claims-fwd-query` on to upstream servers using `X-Forwarded-User-Claims` | false |
 | `-client-id` | string | the OAuth Client ID: ie: `"123456.apps.googleusercontent.com"` | |
 | `-client-secret` | string | the OAuth Client Secret | |
 | `-client-secret-file` | string | the file with OAuth Client Secret | |
@@ -280,6 +282,42 @@ When using claim-based authorization, rules are specified using [JMESpath](https
   ```
 
 For more information on what these types of expressions can do, please see the [JMESpath tutorial](https://jmespath.org/tutorial.html) for lots of examples and a full language specification.
+
+
+## Claims Forwarding
+
+Often it is useful to provide some additional context than just "user name and email" (the default). If you use the `-claims-fwd-query` or `OAUTH2_PROXY_CLAIMS_FWD_QUERY` config option, a [JMESPath](https://jmespath.org) "query expression" can be used to select a subset of the claims that should be forwarded (not all are needed) and/or to remap some claim values into a more application-friendly representation. If you prefer, the entire claims object can be forwarded if desired using the special `@` query (the JMESPath expression for "this"), though use care here as often there may be sensitive information as part of a claims object.
+
+The result of the expression is always well-formed JSON and may be parsed using a library of your choice. The values are not actually used by oauth2-proxy and are considered opaque once extracted.
+
+If the `-pass-claims-fwd` option is also used, it will send this value on to upstream servers via the `X-Forwarded-User-Claims` HTTP header. Otherwise, the values can be read by accessing the user profile endpoint (by default `https://[oauth2-proxy url]/oauth2/userinfo`) via a GET request after authenticating.
+
+Some examples of usage:
+
+* Select the full claims object: `-claims-fwd-query` `@`
+```
+X-Forwarded-User-Claims: {"sub":"gandalf123","name":"Gandalf","job":"Wizard"}
+```
+
+* Select just the job: `-claims-fwd-query` `job`
+```
+X-Forwarded-User-Claims: "Wizard"
+```
+
+* Select name and job (with different key values for each): `-claims-fwd-query` `{n:name,j:job}`
+```
+X-Forwarded-User-Claims: {"n":"Gandalf","j":"Wizard"}
+```
+
+* Select the id using either the 'userid' field (if present), and fallback to 'sub' field: `-claims-fwd-query` `{id:userid||sub}`
+```
+X-Forwarded-User-Claims: {"id":"gandalf123","j":"Wizard"}
+```
+
+* Selecting a field that doesn't exist: `-claims-fwd-query` `favoriteColor`
+```
+X-Forwarded-User-Claims: null
+```
 
 
 ## <a name="nginx-auth-request"></a>Configuring for use with the Nginx `auth_request` directive
