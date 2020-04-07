@@ -61,6 +61,9 @@ func main() {
 	flagSet.String("claim-authorization", "", "JMESPath (https://jmespath.org/) expression that the claims in the id_token must match in order to be considered valid")
 	flagSet.String("claim-authorizations-file", "", "file to read additional claim-authorizations from, one per line (format is the same as for claim-assertions; first match wins)")
 
+	flagSet.String("claims-fwd-expr", "", "extract a portion of the authenticated user's claim structure to forward up/down stream")
+	flagSet.Bool("pass-claims-fwd", false, "if true, and claims-fwd-expr is also set, will send X-Forwarded-User-Claims in upstream request headers")
+
 	flagSet.Var(&emailDomains, "email-domain", "authenticate emails with the specified domain (may be given multiple times). Use * to authenticate any email")
 	flagSet.Var(&whitelistDomains, "whitelist-domain", "allowed domains for redirection after authentication. Prefix domain with a . to allow subdomains (eg .example.com)")
 	flagSet.String("keycloak-group", "", "restrict login to members of this group.")

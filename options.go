@@ -19,6 +19,7 @@ import (
 
 	oidc "github.com/coreos/go-oidc"
 	"github.com/dgrijalva/jwt-go"
+	"github.com/jmespath/go-jmespath"
 	"github.com/mbland/hmacauth"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/apis/options"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/pkg/apis/sessions"
@@ -109,6 +110,9 @@ type Options struct {
 	ClaimAuthorization               string `flag:"claim-authorization" cfg:"claim_authorization" env:"OAUTH2_PROXY_CLAIM_AUTHORIZATION"`
 	ClaimAuthorizationsFile          string `flag:"claim-authorizations-file" cfg:"claim_authorizations_file" env:"OAUTH2_PROXY_CLAIM_AUTHORIZATIONS_FILE"`
 
+	ClaimsFwdQuery string `flag:"claims-fwd-query" cfg:"claims_fwd_query" env:"OAUTH2_PROXY_CLAIMS_FWD_QUERY"`
+	PassClaimsFwd  bool   `flag:"pass-claims-fwd" cfg:"pass_claims_fwd" env:"OAUTH2_PROXY_PASS_CLAIMS_FWD"`
+
 	// Configuration values for logging
 	LoggingFilename       string `flag:"logging-filename" cfg:"logging_filename" env:"OAUTH2_PROXY_LOGGING_FILENAME"`
 	LoggingMaxSize        int    `flag:"logging-max-size" cfg:"logging_max_size" env:"OAUTH2_PROXY_LOGGING_MAX_SIZE"`
@@ -141,6 +145,7 @@ type Options struct {
 	oidcVerifier       *oidc.IDTokenVerifier
 	jwtBearerVerifiers []*oidc.IDTokenVerifier
 	claimsAuthorizer   *JMESValidator
+	claimsFwdExpr      *jmespath.JMESPath
 }
 
 // SignatureData holds hmacauth signature hash and key
@@ -402,6 +407,19 @@ func (o *Options) Validate() error {
 		msgs = append(msgs, fmt.Sprintf("cookie_samesite (%s) must be one of ['', 'lax', 'strict', 'none']", o.CookieSameSite))
 	}
 
+	if o.ClaimsFwdQuery != "" {
+		if o.claimsFwdExpr, err = jmespath.Compile(o.ClaimsFwdQuery); err != nil {
+			o.claimsFwdExpr = nil
+			msgs = append(msgs, fmt.Sprintf("Invalid expression for forwarded claims: %v", err))
+		}
+	}
+
+	if o.PassClaimsFwd && o.claimsFwdExpr == nil {
+		// This should probably be a warning instead... But if this is set without also providing
+		// a valid expression, nothing will be sent, which is not likely what the user intended.
+		msgs = append(msgs, "pass_claims_fwd is set used without also having a valid claims_fwd_expr")
+	}
+
 	msgs = parseClaimAuthorizations(o, msgs)
 	msgs = parseSignatureKey(o, msgs)
 	msgs = validateCookieName(o, msgs)
@@ -414,6 +432,9 @@ func (o *Options) Validate() error {
 	hmacKey := append(o.claimsAuthorizer.RulesHash(), o.CookieSecret...)
 	for _, domain := range o.EmailDomains {
 		hmacKey = append(hmacKey, domain...)
+	}
+	if o.ClaimsFwdQuery != "" {
+		hmacKey = append(hmacKey, o.ClaimsFwdQuery...)
 	}
 	hmacKey, msgs = applyFileDigestSalt(hmacKey, msgs, o.AuthenticatedEmailsFile)
 	hmacKey, msgs = applyFileDigestSalt(hmacKey, msgs, o.HtpasswdFile)

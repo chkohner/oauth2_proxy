@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -341,6 +342,7 @@ type TestProvider struct {
 	EmailAddress   string
 	ValidToken     bool
 	GroupValidator func(string) bool
+	UserClaims     string
 }
 
 func NewTestProvider(providerURL *url.URL, emailAddress string) *TestProvider {
@@ -376,6 +378,21 @@ func (tp *TestProvider) GetEmailAddress(session *sessions.SessionState) (string,
 }
 
 func (tp *TestProvider) ValidateSessionState(session *sessions.SessionState) bool {
+	if tp.ValidToken {
+		if tp.ExtractRawClaims {
+			if tp.UserClaims != "" {
+				var rawClaims map[string]interface{}
+				if err := json.Unmarshal([]byte(tp.UserClaims), &rawClaims); err != nil {
+					// Bad input test data
+					fmt.Printf("Failed to decode rawClaims in test: %v", err)
+					return false
+				}
+				session.SetRawClaims(rawClaims)
+			} else {
+				session.SetRawClaims(nil)
+			}
+		}
+	}
 	return tp.ValidToken
 }
 
@@ -1243,6 +1260,101 @@ func TestRequestSignaturePostRequest(t *testing.T) {
 	st.MakeRequestWithExpectedKey("POST", payload, "d90df39e2d19282840252612dd7c81421a372f61")
 	assert.Equal(t, 200, st.rw.Code)
 	assert.Equal(t, st.rw.Body.String(), "signatures match")
+}
+
+var (
+	sampleUserClaims = `{
+		"age": 34,
+		"name": "James T. Kirk",
+		"orgs": ["Starfleet", "U.S.S. Enterprise"],
+		"traits": { "shirt": "yellow" },
+		"captain": true
+	}`
+)
+
+func TestUserClaimsExtractProperly(t *testing.T) {
+
+	var forwardedClaims string
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload string
+		switch r.URL.Path {
+		case "/oauth/token":
+			payload = `{"access_token": "my_auth_token"}`
+		default:
+			payload = r.Header.Get("Authorization")
+			if payload == "" {
+				payload = "No Authorization header found."
+			}
+		}
+		forwardedClaims = r.Header.Get("X-Forwarded-User-Claims")
+		w.WriteHeader(200)
+		w.Write([]byte(payload))
+	}))
+	defer providerServer.Close()
+
+	providerURL, _ := url.Parse(providerServer.URL)
+	testProvider := NewTestProvider(providerURL, "foo@bar.com")
+	testProvider.UserClaims = sampleUserClaims
+
+	// We're not worried about auth, but we want it to go through the full auth flow...
+
+	var rawClaims map[string]interface{}
+	var serializedAllClaims string
+	json.Unmarshal([]byte(sampleUserClaims), &rawClaims)
+	if buf, err := json.Marshal(rawClaims); err == nil {
+		serializedAllClaims = string(buf)
+	}
+
+	tests := []struct {
+		wantCode   int
+		fwd        bool
+		query      string
+		wantResult string
+	}{
+		// Note: These tests rely on consistent serialization from Go, which is not actually
+		// guaranteed. If they start failing, its possibly due to field orders changing.
+		// We'll need an order-independent comparator in that case...
+		{200, true, "@", serializedAllClaims},
+		{200, true, "name", `"James T. Kirk"`},
+		{200, false, "name", ""},
+		{200, true, "favoriteFood", "null"},
+		// bad jmespath expr
+		{417, true, "captain.sort()", ""},
+	}
+
+	for idx, tt := range tests {
+		t.Run(fmt.Sprintf("test_%d", idx), func(t *testing.T) {
+			pcTest := NewProcessCookieTestWithOptionsModifiers(func(o *Options) {
+				o.PassClaimsFwd = tt.fwd
+				o.ClaimsFwdQuery = tt.query
+				o.Upstreams = []string{providerServer.URL}
+			})
+			pcTest.proxy.provider = testProvider
+
+			// Skip ahead of authentication, as we don't care for this test
+			sess := &sessions.SessionState{
+				Email:       "john.doe@example.com",
+				AccessToken: "my_access_token",
+				CreatedAt:   time.Now(),
+			}
+			sess.SetRawClaims(rawClaims)
+			err := sess.ExtractForwardedClaims(pcTest.proxy.claimsFwdExpr)
+			if tt.wantCode == 200 {
+				assert.NoError(t, err)
+
+				pcTest.SaveSession(sess)
+
+				pcTest.proxy.ServeHTTP(pcTest.rw, pcTest.req)
+				res := pcTest.rw.Result()
+				assert.Equal(t, tt.wantCode, res.StatusCode)
+				assert.Equal(t, tt.wantResult, pcTest.req.Header.Get("X-Forwarded-User-Claims"))
+				assert.Equal(t, tt.wantResult, forwardedClaims)
+			} else {
+				// Simulating the 417 since we're not doing full authz flow. :(
+				assert.Error(t, err)
+			}
+		})
+	}
 }
 
 func TestGetRedirect(t *testing.T) {

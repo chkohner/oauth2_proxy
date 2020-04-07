@@ -2,25 +2,28 @@ package sessions
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc"
+	"github.com/jmespath/go-jmespath"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/encryption"
 )
 
 // SessionState is used to store information about the currently authenticated user session
 type SessionState struct {
-	AccessToken       string    `json:",omitempty"`
-	IDToken           string    `json:",omitempty"`
-	CreatedAt         time.Time `json:"-"`
-	ExpiresOn         time.Time `json:"-"`
-	RefreshToken      string    `json:",omitempty"`
-	Email             string    `json:",omitempty"`
-	User              string    `json:",omitempty"`
-	PreferredUsername string    `json:",omitempty"`
+	AccessToken       string           `json:",omitempty"`
+	IDToken           string           `json:",omitempty"`
+	CreatedAt         time.Time        `json:"-"`
+	ExpiresOn         time.Time        `json:"-"`
+	RefreshToken      string           `json:",omitempty"`
+	Email             string           `json:",omitempty"`
+	User              string           `json:",omitempty"`
+	PreferredUsername string           `json:",omitempty"`
+	ForwardedClaims   *json.RawMessage `json:"fwc,omitempty"`
 
 	// Internal parts used to transfer data between provider
 	// and the main Oauthproxy paths. Not meant to be serialized.
@@ -69,6 +72,9 @@ func (s *SessionState) String() string {
 	if s.RefreshToken != "" {
 		o += " refresh_token:true"
 	}
+	if s.ForwardedClaims != nil {
+		o += " fwd_claims:true"
+	}
 	return o + "}"
 }
 
@@ -80,6 +86,7 @@ func (s *SessionState) EncodeSessionState(c *encryption.Cipher) (string, error) 
 		ss.Email = s.Email
 		ss.User = s.User
 		ss.PreferredUsername = s.PreferredUsername
+		ss.ForwardedClaims = s.ForwardedClaims
 	} else {
 		ss = *s
 		var err error
@@ -118,6 +125,17 @@ func (s *SessionState) EncodeSessionState(c *encryption.Cipher) (string, error) 
 			if err != nil {
 				return "", err
 			}
+		}
+		if ss.ForwardedClaims != nil {
+			var encryptedClaimsStr string
+			encryptedClaimsStr, err = c.Encrypt(string(*ss.ForwardedClaims))
+			if err != nil {
+				return "", err
+			}
+			// Note: RawMessage must be valid json, even as a string, so we
+			// must "re-string" it
+			buf := json.RawMessage([]byte("\"" + encryptedClaimsStr + "\""))
+			ss.ForwardedClaims = &buf
 		}
 	}
 	// Embed SessionState and ExpiresOn pointer into SessionStateJSON
@@ -216,6 +234,7 @@ func DecodeSessionState(v string, c *encryption.Cipher) (*SessionState, error) {
 			Email:             ss.Email,
 			User:              ss.User,
 			PreferredUsername: ss.PreferredUsername,
+			ForwardedClaims:   ss.ForwardedClaims,
 		}
 	} else {
 		// Backward compatibility with using unencrypted Email
@@ -256,6 +275,17 @@ func DecodeSessionState(v string, c *encryption.Cipher) (*SessionState, error) {
 				return nil, err
 			}
 		}
+		if ss.ForwardedClaims != nil {
+			var fwdClaimsStr string
+			// We have to "un-string" the RawMessage value to get the base64 content
+			fwdClaimsStr = string(*ss.ForwardedClaims)
+			fwdClaimsStr, err = c.Decrypt(fwdClaimsStr[1 : len(fwdClaimsStr)-1])
+			if err != nil {
+				return nil, err
+			}
+			buf := json.RawMessage([]byte(fwdClaimsStr))
+			ss.ForwardedClaims = &buf
+		}
 	}
 	if ss.User == "" {
 		ss.User = ss.Email
@@ -281,5 +311,39 @@ func (s *SessionState) SetRawClaimsFromIDToken(idToken *oidc.IDToken) error {
 		return err
 	}
 	s.rawClaimsValid = true
+	return nil
+}
+
+var (
+	errClaimsNotSet = errors.New("RawClaims have not been set on the session")
+)
+
+// ExtractForwardedClaims will use the RawClaims() set on the session and apply a JMESpath
+// expression to create an opaque version of those values suitable to be sent to up/down
+// stream to interested parties.
+func (s *SessionState) ExtractForwardedClaims(expr *jmespath.JMESPath) error {
+	if expr == nil {
+		s.ForwardedClaims = nil
+		return nil
+	}
+
+	if !s.rawClaimsValid {
+		return errClaimsNotSet
+	}
+
+	if val, err := expr.Search(s.rawClaims); err != nil {
+		return err
+	} else if buf, err := json.Marshal(val); err != nil {
+		return err
+	} else {
+		// We need the claims field in SessionState to be opaque as
+		// we don't want potential non-determinism in map-based
+		// json encoding/decoding to mess up our cookie's signature.
+		// Go does not guarantee a map's ordering when encoding
+		// to json.
+		rawMsg := json.RawMessage(buf)
+		s.ForwardedClaims = &rawMsg
+	}
+
 	return nil
 }

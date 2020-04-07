@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
+	"github.com/jmespath/go-jmespath"
 	"github.com/mbland/hmacauth"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/cookies"
@@ -106,6 +107,8 @@ type OAuthProxy struct {
 	jwtBearerVerifiers   []*oidc.IDTokenVerifier
 	compiledRegex        []*regexp.Regexp
 	claimsAuthorizer     *JMESValidator
+	claimsFwdExpr        *jmespath.JMESPath
+	PassClaimsFwd        bool
 	templates            *template.Template
 	Banner               string
 	Footer               string
@@ -271,6 +274,10 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		logger.Printf("Authorizing requests using any of the following claims: %s", strings.Join(claimsAuthRules, ", "))
 	}
 
+	if opts.claimsFwdExpr != nil {
+		logger.Printf("Forwarding claims (upstream: %v) using query: %s", opts.PassClaimsFwd, opts.ClaimsFwdQuery)
+	}
+
 	return &OAuthProxy{
 		CookieName:     opts.CookieName,
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.CookieName, "csrf"),
@@ -305,6 +312,8 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		jwtBearerVerifiers:   opts.jwtBearerVerifiers,
 		compiledRegex:        opts.CompiledRegex,
 		claimsAuthorizer:     opts.claimsAuthorizer,
+		claimsFwdExpr:        opts.claimsFwdExpr,
+		PassClaimsFwd:        opts.PassClaimsFwd,
 		SetXAuthRequest:      opts.SetXAuthRequest,
 		PassBasicAuth:        opts.PassBasicAuth,
 		PassUserHeaders:      opts.PassUserHeaders,
@@ -695,11 +704,13 @@ func (p *OAuthProxy) UserInfo(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	userInfo := struct {
-		Email             string `json:"email"`
-		PreferredUsername string `json:"preferredUsername,omitempty"`
+		Email             string           `json:"email"`
+		PreferredUsername string           `json:"preferredUsername,omitempty"`
+		Claims            *json.RawMessage `json:"claims,omitempty"`
 	}{
 		Email:             session.Email,
 		PreferredUsername: session.PreferredUsername,
+		Claims:            session.ForwardedClaims,
 	}
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
@@ -790,6 +801,17 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 	// set cookie, or deny
 	if ok, reason := p.AuthorizeSession(session); ok {
+
+		if p.claimsFwdExpr != nil {
+			if err := session.ExtractForwardedClaims(p.claimsFwdExpr); err != nil {
+				// Make it obvious if the server sends something that was not anticipated,
+				// since anyone who configured this is likely expecting certain values...
+				p.ErrorPage(rw, 417, "Expectation Failed", "Unable to parse expected response from authentication server")
+				logger.PrintAuthf(session.Email, req, logger.AuthFailure, "User claims did not match expected results: %v", err)
+				return
+			}
+		}
+
 		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2 (rule: %s): %s", reason, session)
 		err := p.SaveSession(rw, req, session)
 		if err != nil {
@@ -947,6 +969,17 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 					session = nil
 					saveSession = false
 					clearSession = true
+				} else {
+					if p.claimsFwdExpr != nil {
+						if err := session.ExtractForwardedClaims(p.claimsFwdExpr); err != nil {
+							// Make it obvious if the server sends something that was not anticipated,
+							// since anyone who configured this is likely expecting certain values...
+							logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Removing re-validatied session because user claims did not match expected results: %v", err)
+							session = nil
+							saveSession = false
+							clearSession = true
+						}
+					}
 				}
 			}
 		}
@@ -1079,6 +1112,14 @@ func (p *OAuthProxy) addHeadersForProxying(rw http.ResponseWriter, req *http.Req
 			rw.Header().Set("Authorization", fmt.Sprintf("Bearer %s", session.IDToken))
 		} else {
 			rw.Header().Del("Authorization")
+		}
+	}
+
+	if p.PassClaimsFwd {
+		if session.ForwardedClaims != nil {
+			req.Header["X-Forwarded-User-Claims"] = []string{string(*session.ForwardedClaims)}
+		} else {
+			req.Header.Del("X-Forwarded-User-Claims")
 		}
 	}
 
