@@ -807,7 +807,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 				// Make it obvious if the server sends something that was not anticipated,
 				// since anyone who configured this is likely expecting certain values...
 				p.ErrorPage(rw, 417, "Expectation Failed", "Unable to parse expected response from authentication server")
-				logger.PrintAuthf(session.Email, req, logger.AuthFailure, "User claims did not match expected results: %v", err)
+				logger.PrintAuthf(session.Email, req, logger.AuthError, "User claims did not match expected results: %v", err)
 				return
 			}
 		}
@@ -974,7 +974,7 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 						if err := session.ExtractForwardedClaims(p.claimsFwdExpr); err != nil {
 							// Make it obvious if the server sends something that was not anticipated,
 							// since anyone who configured this is likely expecting certain values...
-							logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Removing re-validatied session because user claims did not match expected results: %v", err)
+							logger.PrintAuthf(session.Email, req, logger.AuthError, "Removing re-validatied session because user claims did not match expected results: %v", err)
 							session = nil
 							saveSession = false
 							clearSession = true
