@@ -207,6 +207,7 @@ func (p *OIDCProvider) createSessionStateInternal(ctx context.Context, rawIDToke
 
 	newSession.User = claims.Subject
 	newSession.PreferredUsername = claims.PreferredUsername
+	newSession.SetRawClaims(claims.rawClaims)
 
 	verifyEmail := (p.UserIDClaim == emailClaim) && !p.AllowUnverifiedEmail
 	if verifyEmail && claims.Verified != nil && !*claims.Verified {
@@ -218,8 +219,16 @@ func (p *OIDCProvider) createSessionStateInternal(ctx context.Context, rawIDToke
 
 // ValidateSessionState checks that the session's IDToken is still valid
 func (p *OIDCProvider) ValidateSessionState(ctx context.Context, s *sessions.SessionState) bool {
-	_, err := p.Verifier.Verify(ctx, s.IDToken)
-	return err == nil
+	idToken, err := p.Verifier.Verify(ctx, s.IDToken)
+	if err != nil {
+		return false
+	
+	}
+	if p.ExtractRawClaims {
+		// Stash these since the proxy is going to need them...
+		s.SetRawClaimsFromIDToken(idToken)
+	}
+	return true
 }
 
 func getOIDCHeader(accessToken string) http.Header {
@@ -240,6 +249,7 @@ func (p *OIDCProvider) findClaimsFromIDToken(ctx context.Context, idToken *oidc.
 	if err := idToken.Claims(&claims.rawClaims); err != nil {
 		return nil, fmt.Errorf("failed to parse all id_token claims: %v", err)
 	}
+
 
 	userID := claims.rawClaims[p.UserIDClaim]
 	if userID == nil {

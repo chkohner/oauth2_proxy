@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto"
+	"crypto/md5"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -106,6 +109,8 @@ type Options struct {
 	Scope                              string `flag:"scope" cfg:"scope" env:"OAUTH2_PROXY_SCOPE"`
 	Prompt                             string `flag:"prompt" cfg:"prompt" env:"OAUTH2_PROXY_PROMPT"`
 	ApprovalPrompt                     string `flag:"approval-prompt" cfg:"approval_prompt" env:"OAUTH2_PROXY_APPROVAL_PROMPT"` // Deprecated by OIDC 1.0
+	ClaimAuthorization                 string `flag:"claim-authorization" cfg:"claim_authorization" env:"OAUTH2_PROXY_CLAIM_AUTHORIZATION"`
+	ClaimAuthorizationsFile            string `flag:"claim-authorizations-file" cfg:"claim_authorizations_file" env:"OAUTH2_PROXY_CLAIM_AUTHORIZATIONS_FILE"`
 	UserIDClaim                        string `flag:"user-id-claim" cfg:"user_id_claim" env:"OAUTH2_PROXY_USER_ID_CLAIM"`
 
 	// Configuration values for logging
@@ -139,6 +144,7 @@ type Options struct {
 	signatureData      *SignatureData
 	oidcVerifier       *oidc.IDTokenVerifier
 	jwtBearerVerifiers []*oidc.IDTokenVerifier
+	claimsAuthorizer   *JMESValidator
 	realClientIPParser realClientIPParser
 }
 
@@ -471,7 +477,7 @@ func (o *Options) Validate() error {
 	sort.Slice(o.Cookie.Domains, func(i, j int) bool {
 		return len(o.Cookie.Domains[i]) > len(o.Cookie.Domains[j])
 	})
-
+	msgs = parseClaimAuthorizations(o, msgs)
 	msgs = parseSignatureKey(o, msgs)
 	msgs = validateCookieName(o, msgs)
 	msgs = setupLogger(o, msgs)
@@ -483,11 +489,46 @@ func (o *Options) Validate() error {
 		}
 	}
 
+	// Create a key that's unique to the configured instance of the proxy. If this changes, all
+	// existing signed cookies (and thus their sessions) will be considered invalid and the user
+	// will be forced to re-authenticate (even if the provider does so silently). The CookieSecret
+	// is a key bit of salt in the process.
+	hmacKey := append(o.claimsAuthorizer.RulesHash(), o.Cookie.Secret...)
+	for _, domain := range o.EmailDomains {
+		hmacKey = append(hmacKey, domain...)
+	}
+	hmacKey, msgs = applyFileDigestSalt(hmacKey, msgs, o.AuthenticatedEmailsFile)
+	hmacKey, msgs = applyFileDigestSalt(hmacKey, msgs, o.HtpasswdFile)
+	hmacKey = o.provider.ApplyConfigSalt(hmacKey)
+	o.Cookie.HmacKey = hmacKey
+
 	if len(msgs) != 0 {
 		return fmt.Errorf("invalid configuration:\n  %s",
 			strings.Join(msgs, "\n  "))
 	}
 	return nil
+}
+
+func applyFileDigestSalt(salt []byte, msgs []string, path string) ([]byte, []string) {
+	if path == "" {
+		return salt, msgs
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		msgs = append(msgs, fmt.Sprintf("error opening file: %s: %v", path, err))
+		return salt, msgs
+	}
+
+	h := md5.New()
+	_, err = io.Copy(h, f)
+	f.Close()
+
+	if err != nil {
+		msgs = append(msgs, fmt.Sprintf("error creating digest of file: %s: %v", path, err))
+	}
+
+	return append(salt, h.Sum(nil)...), msgs
 }
 
 func parseProviderInfo(o *Options, msgs []string) []string {
@@ -611,6 +652,50 @@ func parseSignatureKey(o *Options, msgs []string) []string {
 			o.SignatureKey)
 	}
 	o.signatureData = &SignatureData{hash: hash, key: secretKey}
+	return msgs
+}
+
+func parseClaimAuthorizations(o *Options, msgs []string) []string {
+
+	v := &JMESValidator{}
+
+	if o.ClaimAuthorization != "" {
+		if _, err := v.AddRule(o.ClaimAuthorization); err != nil {
+			msgs = append(msgs, fmt.Sprintf("%v", err))
+		}
+	}
+
+	if o.ClaimAuthorizationsFile != "" {
+		if file, err := os.Open(o.ClaimAuthorizationsFile); err == nil {
+			lineNo := 0
+			fileScanner := bufio.NewScanner(file)
+			fileScanner.Split(bufio.ScanLines)
+			for fileScanner.Scan() {
+				lineNo++
+				line := fileScanner.Text()
+				if _, err := v.AddRule(line); err != nil {
+					msgs = append(msgs, fmt.Sprintf("error in claims authorization file %s:%d: %v", o.ClaimAuthorizationsFile, lineNo, err))
+				}
+			}
+			file.Close()
+		} else {
+			msgs = append(msgs, fmt.Sprintf("error loading claims authorization file: %v", err))
+		}
+	}
+
+	o.claimsAuthorizer = v
+
+	// Setting ExtractRawClaims here gives the provider a hint that they will be needed when
+	// validating or refreshing a session. If this is false, then the provider is fine to leave them
+	// mainly encoded or do only whatever minimal processing that it requires to function.
+	//
+	// However, if this *is* set, and the provider does not actually provide claims via one of the
+	// sessions.SessionState.SetRawClaims() variants, authorization will fail (since there won't be
+	// any claims to authorize), and an error will be logged. If there are no claims available for
+	// whatever reason, setting the raw claims to nil is fine in order to prevent the error being
+	// logged (but it will likely not pass authorization in that case).
+	o.provider.Data().ExtractRawClaims = !v.IsEmpty()
+
 	return msgs
 }
 

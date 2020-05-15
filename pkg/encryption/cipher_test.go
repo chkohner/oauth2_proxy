@@ -10,13 +10,13 @@ import (
 )
 
 func TestSignAndValidate(t *testing.T) {
-	seed := "0123456789abcdef"
+	seed := []byte("0123456789abcdef")
 	key := "cookie-name"
 	value := base64.URLEncoding.EncodeToString([]byte("I am soooo encoded"))
 	epoch := "123456789"
 
-	sha256sig := cookieSignature(sha256.New, seed, key, value, epoch)
-	sha1sig := cookieSignature(sha1.New, seed, key, value, epoch)
+	sha256sig := hmacToSignature(cookieHMAC(sha256.New, seed, key, value, epoch))
+	sha1sig := hmacToSignature(cookieHMAC(sha1.New, seed, key, value, epoch))
 
 	assert.True(t, checkSignature(sha256sig, seed, key, value, epoch))
 	// This should be switched to False after fully deprecating SHA1

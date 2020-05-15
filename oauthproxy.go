@@ -65,7 +65,6 @@ var (
 
 // OAuthProxy is the main authentication proxy
 type OAuthProxy struct {
-	CookieSeed     string
 	CookieName     string
 	CSRFCookieName string
 	CookieDomains  []string
@@ -111,6 +110,7 @@ type OAuthProxy struct {
 	skipJwtBearerTokens  bool
 	jwtBearerVerifiers   []*oidc.IDTokenVerifier
 	compiledRegex        []*regexp.Regexp
+	claimsAuthorizer     *JMESValidator
 	templates            *template.Template
 	realClientIPParser   realClientIPParser
 	Banner               string
@@ -448,10 +448,14 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 
 	logger.Printf("Cookie settings: name:%s secure(https):%v httponly:%v expiry:%s domains:%s path:%s samesite:%s refresh:%s", opts.Cookie.Name, opts.Cookie.Secure, opts.Cookie.HTTPOnly, opts.Cookie.Expire, strings.Join(opts.Cookie.Domains, ","), opts.Cookie.Path, opts.Cookie.SameSite, refresh)
 
+	claimsAuthRules := opts.claimsAuthorizer.Rules()
+	if len(claimsAuthRules) > 0 {
+		logger.Printf("Authorizing requests using any of the following claims: %s", strings.Join(claimsAuthRules, ", "))
+	}
+
 	return &OAuthProxy{
 		CookieName:     opts.Cookie.Name,
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.Cookie.Name, "csrf"),
-		CookieSeed:     opts.Cookie.Secret,
 		CookieDomains:  opts.Cookie.Domains,
 		CookiePath:     opts.Cookie.Path,
 		CookieSecure:   opts.Cookie.Secure,
@@ -482,6 +486,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		skipJwtBearerTokens:  opts.SkipJwtBearerTokens,
 		jwtBearerVerifiers:   opts.jwtBearerVerifiers,
 		compiledRegex:        opts.compiledRegex,
+		claimsAuthorizer:     opts.claimsAuthorizer,
 		realClientIPParser:   opts.realClientIPParser,
 		SetXAuthRequest:      opts.SetXAuthRequest,
 		PassBasicAuth:        opts.PassBasicAuth,
@@ -983,8 +988,8 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// set cookie, or deny
-	if p.Validator(session.Email) && p.provider.ValidateGroup(session.Email) {
-		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2: %s", session)
+	if ok, reason := p.AuthorizeSession(session); ok {
+		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2 (rule: %s): %s", reason, session)
 		err := p.SaveSession(rw, req, session)
 		if err != nil {
 			logger.Printf("%s %s", remoteAddr, err)
@@ -993,9 +998,66 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 		}
 		http.Redirect(rw, req, redirect, http.StatusFound)
 	} else {
-		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: unauthorized")
+		if reason != "" {
+			logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: unauthorized: %s", reason)
+		} else {
+			logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: unauthorized")
+		}
 		p.ErrorPage(rw, 403, "Permission Denied", "Invalid Account")
 	}
+}
+
+// AuthorizeSession will check the session state and ensure that it meets
+// all of the authorization criteria (email domains and/or claims criteria).
+// If it hasn't, it will return false along with a loggable description of why.
+// If it has, it will also return the rule that was used to authorize the user.
+func (p *OAuthProxy) AuthorizeSession(s *sessionsapi.SessionState) (authorized bool, reason string) {
+
+	if !p.Validator(s.Email) {
+		return false, "failed email validation"
+	}
+
+	if !p.provider.ValidateGroup(s.Email) {
+		return false, "failed group validation"
+	}
+
+	return p.ValidateAuthorizedClaims(s)
+}
+
+// ValidateAuthorizedClaims will extract any claims from the idtoken and check them
+// against the rules configured to allow acceptance.
+//  - If no assertions were specified, it will trivially accept any (or no) claims.
+//  - Otherwise, the first assertion that evaluates to a ["truthy"](https://developer.mozilla.org/en-US/docs/Glossary/Truthy) result will return true.
+//  - If no assertion matches, the claims are not deemed acceptable and false is returned.
+func (p *OAuthProxy) ValidateAuthorizedClaims(s *sessionsapi.SessionState) (bool, string) {
+
+	if p.claimsAuthorizer.IsEmpty() {
+		return true, "*"
+	}
+
+	if !s.RawClaimsValid() {
+		// If we got here, then the session was created/deserialized and there were no claims.
+		// Either the cookie was unencrypted (and thus has only basic information), or the provider
+		// didn't, uh, provide, the claims. ;) The latter is an implementation error as all providers
+		// should honor this request if they are able, even if that means setting the claims to
+		// nil.
+
+		// We'll print something at least so that the person who's set up this proxy knows about it
+		// and isn't left wondering why it doesn't work.
+		logger.Printf("error: claims-based authorization is enabled, but the session has no claims to validate; all requests will fail to authorize (this is likely a config problem)")
+		return false, "claims are unknown"
+	}
+
+	if ok, idx := p.claimsAuthorizer.MatchesAny(s.RawClaims()); ok {
+		return true, p.claimsAuthorizer.Rules()[idx]
+	}
+
+	// It's pretty hard to troubleshoot configuration if we can't see what claims are failing...
+	if buf, err := json.Marshal(s.RawClaims()); err == nil {
+		return false, fmt.Sprintf("claims are not authorized: %s", string(buf))
+	}
+
+	return false, "claims are not authorized"
 }
 
 // AuthenticateOnly checks whether the user is currently logged in
@@ -1082,6 +1144,14 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 			} else if ok {
 				saveSession = true
 				revalidated = true
+
+				// Token was refreshed, make sure authorization still applies.
+				if ok, reason := p.AuthorizeSession(session); !ok {
+					logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Removing re-validated session because it failed authorization (rule: %s): %s", reason, session)
+					session = nil
+					saveSession = false
+					clearSession = true
+				}
 			}
 		}
 	}
@@ -1100,13 +1170,6 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 			session = nil
 			clearSession = true
 		}
-	}
-
-	if session != nil && session.Email != "" && !p.Validator(session.Email) {
-		logger.Printf(session.Email, req, logger.AuthFailure, "Invalid authentication via session: removing session %s", session)
-		session = nil
-		saveSession = false
-		clearSession = true
 	}
 
 	if saveSession && session != nil {
