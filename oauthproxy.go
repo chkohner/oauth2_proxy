@@ -970,8 +970,8 @@ func (p *OAuthProxy) UserInfo(rw http.ResponseWriter, req *http.Request) {
 
 	// Otherwise just return very basic info.
 	userInfo := struct {
-		Email             string           `json:"email"`
-		PreferredUsername string           `json:"preferredUsername,omitempty"`
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferredUsername,omitempty"`
 	}{
 		Email:             session.Email,
 		PreferredUsername: session.PreferredUsername,
